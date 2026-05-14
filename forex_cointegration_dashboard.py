@@ -1,3 +1,4 @@
+import sys
 import pandas as pd
 import numpy as np
 import yfinance as yf
@@ -57,6 +58,7 @@ telegram_chat_id = "YOUR_CHAT_ID"
 # Global cache to prevent redundant API calls
 _cached_close_prices = None
 _last_refresh = None
+IS_STREAMLIT = "streamlit" in sys.modules or "streamlit.runtime" in sys.modules
 
 os.makedirs('dashboard_output', exist_ok=True)
 
@@ -76,14 +78,45 @@ def download_data(interval):
                                group_by='ticker', auto_adjust=True, progress=False)
     data = cast(pd.DataFrame, data_any)
     
-    if data.empty:
+    if data.empty or data.shape[1] == 0:
         raise ValueError("No data downloaded. Please check your internet connection or ticker symbols.")
 
-    if isinstance(data.columns, pd.MultiIndex):
-        # When group_by='ticker' is used, 'Close' is at level 1 (Ticker, Attribute)
-        close = data.xs('Close', level=1, axis=1)
-    else:
-        close = data
+    def extract_close_prices(df: pd.DataFrame) -> pd.DataFrame:
+        if isinstance(df.columns, pd.MultiIndex):
+            # Try common field names first
+            for field in ("Close", "Adj Close"):
+                if field in df.columns.get_level_values(-1):
+                    try:
+                        return cast(pd.DataFrame, df.xs(field, level=-1, axis=1))
+                    except Exception:
+                        pass
+
+            # Search levels for any OHLC-like label
+            level_values = [list(df.columns.get_level_values(i).unique()) for i in range(df.columns.nlevels)]
+            candidates = {"Close", "Adj Close", "close", "adj close"}
+            for level_idx, values in enumerate(level_values):
+                if any(v in candidates for v in values):
+                    try:
+                        field = next(v for v in values if v in candidates)
+                        return cast(pd.DataFrame, df.xs(field, level=level_idx, axis=1))
+                    except Exception:
+                        pass
+
+            raise KeyError(
+                "Could not extract 'Close'/'Adj Close' from yfinance MultiIndex columns."
+            )
+
+        if "Close" in df.columns:
+            out = cast(pd.DataFrame, df["Close"])
+            return out.to_frame() if isinstance(out, pd.Series) else out
+
+        if "Adj Close" in df.columns:
+            out = cast(pd.DataFrame, df["Adj Close"])
+            return out.to_frame() if isinstance(out, pd.Series) else out
+
+        return cast(pd.DataFrame, df)
+
+    close = extract_close_prices(data)
 
     close = close.ffill().dropna(how='all')
     close.to_csv('dashboard_output/close_prices.csv')
@@ -641,12 +674,171 @@ def run_dashboard():
         except Exception as e:
             print(f"An error occurred: {e}")
 
+# ========================= STREAMLIT UI =========================
+def run_streamlit():
+    st.set_page_config(page_title="Forex Cointegration Dashboard", layout="wide")
+    st.title("📊 Forex Cointegration Trading Dashboard")
+    st.markdown("**Statistical Arbitrage • Pairs Trading Scanner**")
+
+    with st.sidebar:
+        st.header("⚙️ Strategy Settings")
+        interval = st.selectbox("Interval", ['1d', '4h', '1h'], index=0)
+        corr_threshold = st.slider("Min Correlation", 0.3, 0.9, DEFAULT_CORR, step=0.05)
+        p_value_threshold = st.slider("Max p-value", 0.001, 0.1, DEFAULT_PVAL, step=0.001)
+        z_window = st.slider("Z-Score Window", 20, 60, DEFAULT_WINDOW)
+        z_entry = st.slider("Z Entry", 1.5, 3.0, DEFAULT_Z_ENTRY, step=0.1)
+        z_exit = st.slider("Z Exit", 0.1, 1.0, DEFAULT_Z_EXIT, step=0.1)
+        z_stop = st.slider("Z Stop", 3.0, 6.0, DEFAULT_Z_STOP, step=0.1)
+        transaction_cost_z = st.slider("Transaction Cost (Z-units)", 0.0, 0.5, DEFAULT_COST, step=0.01)
+
+        st.markdown("---")
+        st.header("💰 Risk Management")
+        account_size = st.number_input("Account Size (USD)", min_value=1000, value=DEFAULT_ACCOUNT, step=1000)
+        risk_per_trade = st.slider("Risk per Trade (%)", 0.1, 5.0, DEFAULT_RISK * 100, step=0.1) / 100
+
+    if 'analysis_results' not in st.session_state:
+        st.session_state.analysis_results = None
+
+    if st.button("🔄 Run Full Analysis", type="primary", use_container_width=True):
+        with st.spinner("Downloading data and scanning..."):
+            try:
+                close_prices = download_data(interval)
+                coint_pairs = scan_cointegration(close_prices, corr_threshold, p_value_threshold)
+                
+                if coint_pairs.empty:
+                    st.error("No cointegrated pairs found.")
+                    st.session_state.analysis_results = None
+                    return
+
+                active_list = []
+                watchlist = []
+                history_df = load_signal_history()
+                
+                for _, row in coint_pairs.head(20).iterrows():
+                    sig = calculate_signals(row['Pair1'], row['Pair2'], row['Hedge_Ratio'],
+                                            close_prices, z_window, z_entry, z_exit, z_stop, interval)
+                    pair_name = f"{row['Pair1']}/{row['Pair2']}"
+                    
+                    # Logic for signal tracking age
+                    pair_history = history_df[history_df['Pair'] == pair_name].sort_values('Timestamp')
+                    age = 1
+                    if not pair_history.empty:
+                        last_recorded_signal = pair_history.iloc[-1]['Signal']
+                        if sig['signal'] == last_recorded_signal:
+                            last_ts = pd.to_datetime(pair_history.iloc[-1]['Timestamp'])
+                            period_sec = 86400 if interval == '1d' else (14400 if interval == '4h' else 3600)
+                            age = round((datetime.now() - last_ts).total_seconds() / period_sec, 1) + 1
+
+                    track_signal(pair_name, sig['signal'], sig['latest_z'], history_df)
+
+                    if "FLAT" not in sig['signal']:
+                        active_list.append({
+                            'Pair': pair_name, 'Z-Score': sig['latest_z'],
+                            'Status': sig['signal'], 'Age': age
+                        })
+                    elif abs(sig['latest_z']) > 1.5:
+                        watchlist.append({
+                            'Pair': pair_name, 'Z-Score': sig['latest_z'],
+                            'Status': "👀 WATCH", 'Age': age
+                        })
+
+                st.session_state.analysis_results = {
+                    'close_prices': close_prices, 'coint_pairs': coint_pairs,
+                    'active_list': active_list, 'watchlist': watchlist,
+                    'settings': {
+                        'interval': interval, 'z_window': z_window,
+                        'z_entry': z_entry, 'z_exit': z_exit, 'z_stop': z_stop,
+                        'account_size': account_size, 'risk_per_trade': risk_per_trade,
+                        'transaction_cost_z': transaction_cost_z
+                    }
+                }
+                st.success(f"Analysis complete! Found {len(coint_pairs)} pairs.")
+            except Exception as e:
+                st.error(f"Error: {e}")
+
+    if st.session_state.analysis_results:
+        res = st.session_state.analysis_results
+        tab1, tab2, tab3, tab4 = st.tabs(["🚨 Signals", "📋 All Pairs", "🔍 Deep Dive", "📈 Backtest"])
+
+        with tab1:
+            col1, col2 = st.columns(2)
+            with col1:
+                st.subheader("Active Signals")
+                if res['active_list']:
+                    st.dataframe(pd.DataFrame(res['active_list']), use_container_width=True)
+                else:
+                    st.info("No active signals.")
+            with col2:
+                st.subheader("Watchlist")
+                if res['watchlist']:
+                    st.dataframe(pd.DataFrame(res['watchlist']), use_container_width=True)
+                else:
+                    st.info("Watchlist empty.")
+            
+            exposure = calculate_portfolio_exposure(res['active_list'])
+            if exposure:
+                st.subheader("Currency Exposure")
+                st.write(exposure)
+
+        with tab2:
+            st.subheader("Cointegrated Pairs")
+            st.dataframe(res['coint_pairs'], use_container_width=True)
+
+        with tab3:
+            idx = st.selectbox("Select Pair", range(len(res['coint_pairs'])), 
+                               format_func=lambda x: f"{res['coint_pairs'].iloc[x]['Pair1']}/{res['coint_pairs'].iloc[x]['Pair2']}")
+            row = res['coint_pairs'].iloc[idx]
+            s = res['settings']
+            sig = calculate_signals(row['Pair1'], row['Pair2'], row['Hedge_Ratio'], res['close_prices'],
+                                    s['z_window'], s['z_entry'], s['z_exit'], s['z_stop'], s['interval'])
+            
+            col1, col2, col3 = st.columns(3)
+            col1.metric("Z-Score", sig['latest_z'])
+            col2.metric("Signal", sig['signal'])
+            col3.metric("Half-Life", f"{sig['half_life']} days")
+
+            st.markdown("---")
+            st.subheader("Risk & Sizing")
+            risk_amount = s['account_size'] * s['risk_per_trade']
+            z_risk_dist = s['z_stop'] - s['z_entry']
+            vol_adj_notional = risk_amount / (z_risk_dist * sig['spread_std']) if sig['spread_std'] > 0 else 0
+            
+            st.write(f"**Risk Amount:** ${risk_amount:,.2f}")
+            st.write(f"**Vol-Adjusted Notional:** ${vol_adj_notional:,.2f}")
+            st.write(f"**Target Price ({row['Pair1']}):** {sig['target_price1']}")
+            
+            st.pyplot(plot_pair(row['Pair1'], row['Pair2'], row['Hedge_Ratio'], sig['spread'], sig['z_score']))
+
+        with tab4:
+            idx_bt = st.selectbox("Select Pair for Backtest", range(len(res['coint_pairs'])), 
+                                  format_func=lambda x: f"{res['coint_pairs'].iloc[x]['Pair1']}/{res['coint_pairs'].iloc[x]['Pair2']}", key="bt_sel")
+            row_bt = res['coint_pairs'].iloc[idx_bt]
+            s = res['settings']
+            sig_bt = calculate_signals(row_bt['Pair1'], row_bt['Pair2'], row_bt['Hedge_Ratio'], res['close_prices'],
+                                       s['z_window'], s['z_entry'], s['z_exit'], s['z_stop'], s['interval'])
+            
+            num_t, wr, pnl, mdd, k, fig = backtest_pair(sig_bt['z_score'], f"{row_bt['Pair1']}/{row_bt['Pair2']}",
+                                                       s['z_entry'], s['z_exit'], s['z_stop'], s['transaction_cost_z'])
+            
+            if num_t > 0:
+                col1, col2, col3, col4 = st.columns(4)
+                col1.metric("Trades", num_t)
+                col2.metric("Win Rate", f"{wr}%")
+                col3.metric("PnL (Z)", pnl)
+                col4.metric("Kelly", k)
+                st.pyplot(fig)
+            else:
+                st.info("No trades in sample.")
+
 # ========================= RUN =========================
 if __name__ == "__main__":
-    print("Starting Forex Cointegration Dashboard...")
-    while True:
-        run_dashboard()
-        again = input("\nRun dashboard again? (y/n): ").strip().lower()
-        if again != 'y':
-            print("Thank you for using the dashboard!")
-            break
+    if IS_STREAMLIT:
+        run_streamlit()
+    else:
+        print("Starting Forex Cointegration Dashboard...")
+        while True:
+            run_dashboard()
+            again = input("\nRun dashboard again? (y/n): ").strip().lower()
+            if again != 'y':
+                print("Thank you for using the dashboard!")
+                break
