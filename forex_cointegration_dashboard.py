@@ -311,7 +311,7 @@ def backtest_pair(z_score, pair_name, z_entry, z_exit, z_stop, transaction_cost_
 
     return len(trades), round(win_rate, 1), round(total_z_pnl, 2), max_dd, round(kelly, 4), fig
 
-def plot_pair(pair1, pair2, hedge_ratio, spread, z_score):
+def plot_pair(pair1, pair2, hedge_ratio, spread, z_score, z_entry, z_exit, z_stop):
     # Spread and z_score are now passed directly, avoiding re-calculation
     # log_p = np.log(close_prices[[pair1, pair2]]).dropna()
     # spread = log_p[pair1] - hedge_ratio * log_p[pair2]
@@ -324,9 +324,11 @@ def plot_pair(pair1, pair2, hedge_ratio, spread, z_score):
     ax1.legend()
     
     ax2.plot(z_score, label='Z-Score', color='purple')
-    # Note: Entry lines are static 2.0/-2.0 for plot context
-    ax2.axhline(2.0, color='red', linestyle='--')
-    ax2.axhline(-2.0, color='green', linestyle='--')
+    ax2.axhline(z_entry, color='orange', linestyle='--', label=f'Entry (+{z_entry})')
+    ax2.axhline(-z_entry, color='orange', linestyle='--')
+    ax2.axhline(z_exit, color='green', linestyle=':', label=f'Exit (+-{z_exit})')
+    ax2.axhline(-z_exit, color='green', linestyle=':')
+    ax2.axhline(z_stop, color='red', linestyle='-.', label=f'Stop (+-{z_stop})')
     ax2.axhline(0, color='black', alpha=0.5)
     ax2.set_title('Z-Score')
     ax2.legend()
@@ -662,7 +664,8 @@ def run_dashboard():
                 print("="*60)
                 # Pass pre-calculated spread and z_score to plot_pair
                 plot_pair(selected['Pair1'], selected['Pair2'], selected['Hedge_Ratio'], 
-                          signals['spread'], signals['z_score'])
+                          signals['spread'], signals['z_score'],
+                          z_entry_local, z_exit_local, z_stop_local)
                 
                 # Re-display the list for the next selection
                 print(f"\nCointegrated Pairs available (from current scan):")
@@ -713,6 +716,7 @@ def run_streamlit():
                 active_list = []
                 watchlist = []
                 history_df = load_signal_history()
+                scanned_count = 0
                 
                 for _, row in coint_pairs.head(20).iterrows():
                     sig = calculate_signals(row['Pair1'], row['Pair2'], row['Hedge_Ratio'],
@@ -741,10 +745,12 @@ def run_streamlit():
                             'Pair': pair_name, 'Z-Score': sig['latest_z'],
                             'Status': "👀 WATCH", 'Age': age
                         })
+                    scanned_count += 1
 
                 st.session_state.analysis_results = {
                     'close_prices': close_prices, 'coint_pairs': coint_pairs,
                     'active_list': active_list, 'watchlist': watchlist,
+                    'scanned_count': scanned_count,
                     'settings': {
                         'interval': interval, 'z_window': z_window,
                         'z_entry': z_entry, 'z_exit': z_exit, 'z_stop': z_stop,
@@ -761,6 +767,11 @@ def run_streamlit():
         tab1, tab2, tab3, tab4 = st.tabs(["🚨 Signals", "📋 All Pairs", "🔍 Deep Dive", "📈 Backtest"])
 
         with tab1:
+            st.info(f"Analyzed top {res['scanned_count']} cointegrated pairs from {len(res['coint_pairs'])} total matches.")
+            
+            if not res['active_list'] and not res['watchlist']:
+                st.warning("No active signals or watchlist items. Consider lowering the 'Min Correlation' or increasing 'Max p-value' to find more pairs, or lowering 'Z Entry' to trigger more signals.")
+
             col1, col2 = st.columns(2)
             with col1:
                 st.subheader("Active Signals")
@@ -773,7 +784,7 @@ def run_streamlit():
                 if res['watchlist']:
                     st.dataframe(pd.DataFrame(res['watchlist']), use_container_width=True)
                 else:
-                    st.info("Watchlist empty.")
+                    st.write("No pairs currently near entry thresholds.")
             
             exposure = calculate_portfolio_exposure(res['active_list'])
             if exposure:
@@ -807,7 +818,8 @@ def run_streamlit():
             st.write(f"**Vol-Adjusted Notional:** ${vol_adj_notional:,.2f}")
             st.write(f"**Target Price ({row['Pair1']}):** {sig['target_price1']}")
             
-            st.pyplot(plot_pair(row['Pair1'], row['Pair2'], row['Hedge_Ratio'], sig['spread'], sig['z_score']))
+            st.pyplot(plot_pair(row['Pair1'], row['Pair2'], row['Hedge_Ratio'], sig['spread'], sig['z_score'],
+                                s['z_entry'], s['z_exit'], s['z_stop']))
 
         with tab4:
             idx_bt = st.selectbox("Select Pair for Backtest", range(len(res['coint_pairs'])), 
